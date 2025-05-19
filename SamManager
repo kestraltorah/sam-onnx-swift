@@ -1,0 +1,244 @@
+import UIKit
+import onnxruntime_objc
+
+enum SegmentError: Error {
+    case noEncodeSession
+    case noDecodeSession
+    case imageEncodeError
+    case encodeError
+}
+
+class SamManager: NSObject {
+    static let shared = SamManager()
+    // 编码路径
+    let encodePath = Bundle.main.path(forResource: "encoder", ofType: "ort")!
+    // 解码路径
+    let decodePath = Bundle.main.path(forResource: "decoder", ofType: "ort")!
+    // 编码输入的宽度
+    let inputWidth: Float = 1024
+    // 编码输入的高度
+    let inputHeight: Float = 684
+    
+    // 模型环境
+    var ortEnv: ORTEnv?
+    // 编码模型
+    var encodeSession: ORTSession?
+    // 解码模型
+    var decodeSession: ORTSession?
+}
+
+// MARK: - 模型初始化
+extension SamManager {
+    
+    /// 初始化模型
+    /// 1、编码模型
+    /// 2、解码模型
+    func initModels() throws {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            let decodeTime = CFAbsoluteTimeGetCurrent()
+            logInfo("初始化SAM模型成功: \(decodeTime - startTime)")
+        }
+        // 初始化环境
+        self.ortEnv = try ORTEnv(loggingLevel: .error)
+        try reloadEncodeAndDecodeSession()
+    }
+    
+    // 重新加载编码、解码Session
+    func reloadEncodeAndDecodeSession() throws {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            let decodeTime = CFAbsoluteTimeGetCurrent()
+            logInfo("更新SAM模型成功: \(decodeTime - startTime)")
+        }
+        guard let ortEnv = ortEnv else { return }
+        // 配置
+        let options = try ORTSessionOptions()
+        try options.setLogSeverityLevel(.error)
+        try options.addConfigEntry(withKey: "session.load_model_format", value: "ORT")
+        try options.setIntraOpNumThreads(3) // 线程
+        
+        // 加载模型session
+        self.encodeSession = try ORTSession(env: ortEnv,
+                                            modelPath: encodePath,
+                                            sessionOptions: options)
+        self.decodeSession = try ORTSession(env: ortEnv,
+                                            modelPath: decodePath,
+                                            sessionOptions: options)
+    }
+}
+
+// MARK: - 编码图片
+extension SamManager {
+    /// 编码图片
+    /// - Parameter image: 输入的图片
+    /// - Returns: 编码结果 外部应该持有该结果 因为编码是一个耗时操作
+    func encodeImage(image: UIImage) throws -> EncodeModel {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            let decodeTime = CFAbsoluteTimeGetCurrent()
+            logInfo("编码耗时: \(decodeTime - startTime)")
+        }
+        guard let encodeSession = encodeSession else {
+            throw SegmentError.noEncodeSession
+        }
+        // 重采样图片
+        let reSize = CGSize(width: CGFloat(inputWidth), height: CGFloat(inputHeight))
+        // TODO: 重采样可能会造成精度丢失 尝试使用crop？
+        guard let imageData = image.encode(reSize: reSize) else {
+            throw SegmentError.imageEncodeError
+        }
+        // tensor: float32[image_height,image_width,3]
+        let encodeShape: [NSNumber] = [inputHeight, inputWidth, 3] as [NSNumber]
+        let inputTensor = try SegmentHelper.createORTValue(tensorData: imageData,
+                                                           tensorShape: encodeShape)
+        
+        // 进行编码
+        let outputs = try encodeSession.run(withInputs: ["input_image": inputTensor],
+                                            outputNames: ["image_embeddings"],
+                                            runOptions: nil)
+        let image_embeddings = outputs["image_embeddings"]
+        guard let image_embeddings = image_embeddings else {
+            throw SegmentError.encodeError
+        }
+        let encodeModel = EncodeModel(image_embeddings: image_embeddings,
+                                      originImageSize: image.size)
+        return encodeModel
+    }
+}
+
+// MARK: - 解码图片
+extension SamManager {
+    func decodeImage(encodeModel: EncodeModel, points: [SamPoint]) throws -> DecodeModel {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            let decodeTime = CFAbsoluteTimeGetCurrent()
+            logInfo("解码耗时: \(decodeTime - startTime)")
+        }
+        guard let decodeSession = decodeSession else {
+            throw SegmentError.noDecodeSession
+        }
+        // tensor: float32[1,256,64,64]
+        let image_embeddings = encodeModel.image_embeddings
+        // tensor: float32[1,num_points,2]
+        let actualPoints = points.map {
+            $0.point.getActualPointFrom(reSize: CGSize(width: CGFloat(inputWidth),
+                                                 height: CGFloat(inputHeight)),
+                                  originSize: encodeModel.originImageSize)
+        }
+        /**
+         计算方式：
+         点位：[x1, y1], [x2, y2], [x3, y3] 如果是点位输入需要拼接[0, 0]
+         label： [1, 1, 0, -1] // -1表示填充点 应该是对应[0, 0] 1表示希望分割的位置 0表示希望忽略的位置
+         */
+        var pointArray = actualPoints.map { [Float($0.x), Float($0.y)] }
+        pointArray.append([0.0, 0.0])
+        /**
+         * `point_coords`: Coordinates of sparse input prompts, corresponding to both point inputs and box inputs. Boxes are encoded using two points, one for the top-left corner and one for the bottom-right corner. *Coordinates must already be transformed to long-side 1024.* Has a batch index of length 1.
+         */
+        let point_coords = try SegmentHelper.createORTValue(from3DArray: [pointArray])
+        // tensor: float32[1,num_points]
+        /**
+         * `point_labels`: Labels for the sparse input prompts. 0 is a negative input point, 1 is a positive input point, 2 is a top-left box corner, 3 is a bottom-right box corner, and -1 is a padding point. *If there is no box input, a single padding point with label -1 and coordinates (0.0, 0.0) should be concatenated.*
+         */
+        var pointLabelArray: [Float] = points.map { $0.pointOption.rawValue }
+        pointLabelArray.append(-1.0)
+        let point_labels = try SegmentHelper.createORTValue(from2DArray: [pointLabelArray])
+        // tensor: float32[1,1,256,256]
+        let mask_input = try SegmentHelper.createORTValue(from4DArray: SegmentHelper.create4DEmptyArray())
+        // tensor: float32[1]
+        let has_mask_input = try SegmentHelper.createORTValue(from1DArray: [0.0])
+        // tensor: float32[2]
+        let orig_im_size = try SegmentHelper.createORTValue(from1DArray: [inputWidth, inputHeight])
+        
+        let runOptions = try ORTRunOptions()
+        try runOptions.setLogSeverityLevel(.error)
+        
+        // 进行解码
+        let outputs = try decodeSession.run(withInputs: ["image_embeddings": image_embeddings,
+                                                          "point_coords": point_coords,
+                                                          "point_labels": point_labels,
+                                                          "mask_input": mask_input,
+                                                          "has_mask_input": has_mask_input,
+                                                          "orig_im_size": orig_im_size],
+                                             outputNames: ["masks",
+                                                           "iou_predictions",
+                                                           "low_res_masks"],
+                                             runOptions: runOptions)
+        guard let masks = outputs["masks"],
+              let iou_predictions = outputs["iou_predictions"],
+              let low_res_masks = outputs["low_res_masks"] else {
+            throw SegmentError.encodeError
+        }
+        let decodeModel = DecodeModel(masks: masks,
+                                      iou_predictions: iou_predictions,
+                                      low_res_masks: low_res_masks)
+        return decodeModel
+    }
+    
+    func decodeBoxImage(encodeModel: EncodeModel, points: [SamBoxPoint]) throws -> DecodeModel {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            let decodeTime = CFAbsoluteTimeGetCurrent()
+            logInfo("解码耗时: \(decodeTime - startTime)")
+        }
+        guard let decodeSession = decodeSession else {
+            throw SegmentError.noDecodeSession
+        }
+        // tensor: float32[1,256,64,64]
+        let image_embeddings = encodeModel.image_embeddings
+        // tensor: float32[1,num_points,2]
+        let actualPoints = points.map {
+            $0.point.getActualPointFrom(reSize: CGSize(width: CGFloat(inputWidth),
+                                                 height: CGFloat(inputHeight)),
+                                  originSize: encodeModel.originImageSize)
+        }
+        /**
+         计算方式：
+         点位：[x1, y1], [x2, y2], [x3, y3] 如果是点位输入需要拼接[0, 0]
+         label： [1, 1, 0, -1] // -1表示填充点 应该是对应[0, 0] 1表示希望分割的位置 0表示希望忽略的位置
+         */
+        let pointArray = actualPoints.map { [Float($0.x), Float($0.y)] }
+        /**
+         * `point_coords`: Coordinates of sparse input prompts, corresponding to both point inputs and box inputs. Boxes are encoded using two points, one for the top-left corner and one for the bottom-right corner. *Coordinates must already be transformed to long-side 1024.* Has a batch index of length 1.
+         */
+        let point_coords = try SegmentHelper.createORTValue(from3DArray: [pointArray])
+        // tensor: float32[1,num_points]
+        /**
+         * `point_labels`: Labels for the sparse input prompts. 0 is a negative input point, 1 is a positive input point, 2 is a top-left box corner, 3 is a bottom-right box corner, and -1 is a padding point. *If there is no box input, a single padding point with label -1 and coordinates (0.0, 0.0) should be concatenated.*
+         */
+        // 2,3
+        let pointLabelArray: [Float] = points.map { $0.boxOption.rawValue }
+        let point_labels = try SegmentHelper.createORTValue(from2DArray: [pointLabelArray])
+        // tensor: float32[1,1,256,256]
+        let mask_input = try SegmentHelper.createORTValue(from4DArray: SegmentHelper.create4DEmptyArray())
+        // tensor: float32[1]
+        let has_mask_input = try SegmentHelper.createORTValue(from1DArray: [0.0])
+        // tensor: float32[2]
+        let orig_im_size = try SegmentHelper.createORTValue(from1DArray: [inputWidth, inputHeight])
+        
+        let runOptions = try ORTRunOptions()
+        try runOptions.setLogSeverityLevel(.error)
+        
+        // 进行解码
+        let outputs = try decodeSession.run(withInputs: ["image_embeddings": image_embeddings,
+                                                          "point_coords": point_coords,
+                                                          "point_labels": point_labels,
+                                                          "mask_input": mask_input,
+                                                          "has_mask_input": has_mask_input,
+                                                          "orig_im_size": orig_im_size],
+                                             outputNames: ["masks",
+                                                           "iou_predictions",
+                                                           "low_res_masks"],
+                                             runOptions: runOptions)
+        guard let masks = outputs["masks"],
+              let iou_predictions = outputs["iou_predictions"],
+              let low_res_masks = outputs["low_res_masks"] else {
+            throw SegmentError.encodeError
+        }
+        let decodeModel = DecodeModel(masks: masks,
+                                      iou_predictions: iou_predictions,
+                                      low_res_masks: low_res_masks)
+        return decodeModel
+    }
+}
